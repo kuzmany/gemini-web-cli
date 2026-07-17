@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# gemini-img — generate/edit an image via the real logged-in gemini.google.com tab
+# (browser-piggyback). Uses your Gemini subscription (Nano Banana), NOT the API.
+#
+# text->image:   gemini-img "a red cat on a blue chair" [outdir]
+# image->image:  gemini-img -i photo.png "make it winter, snow everywhere" [outdir]
+# Flags:  -p <prefix>   output filename prefix       -i <path>  input image to edit
+# Env:    GEMINI_OUT (default ~/gemini-web/out), GEMINI_PREFIX, GEMINI_TIMEOUT (s)
+# Host-agnostic: input images upload over CDP (no shared filesystem), local or remote Chrome.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DRIVER="$HERE/driver_img.py"
+
+PREFIX="${GEMINI_PREFIX:-gen}"; IMG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--prefix) PREFIX="$2"; shift 2 ;;
+    -i|--image)  IMG="$2";    shift 2 ;;
+    *) break ;;
+  esac
+done
+
+PROMPT="${1:-}"
+[ -z "$PROMPT" ] && { echo "usage: gemini-img [-p prefix] [-i input.png] \"prompt\" [outdir]" >&2; exit 2; }
+OUT="${2:-${GEMINI_OUT:-$HOME/gemini-web/out}}"
+
+# image->image: pass the LOCAL path; the driver uploads it host-agnostically over CDP.
+if [ -n "$IMG" ]; then
+  [ -f "$IMG" ] || { echo "input image not found: $IMG" >&2; exit 2; }
+  export GEMINI_INPUT_PATH="$(readlink -f "$IMG")"
+fi
+
+GEMINI_PROMPT="$PROMPT" GEMINI_OUT="$OUT" GEMINI_PREFIX="$PREFIX" \
+GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-420}" \
+  browser-harness -c "exec(open('$DRIVER').read())" 2>&1 \
+  | sed -n 's/^RESULT //p'

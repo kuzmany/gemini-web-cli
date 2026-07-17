@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# gemini-vid — generate/animate a VIDEO (Veo) via the real logged-in gemini.google.com tab
+# (browser-piggyback). Uses your Gemini subscription (Veo/Flow credits), NOT the API.
+#
+# text->video:   gemini-vid "a red balloon floating over a green meadow" [outdir]
+# image->video:  gemini-vid -i photo.png "gentle push-in, leaves sway" [outdir]
+# Flags:  -p <prefix>   output filename prefix       -i <path>  input image to animate
+# Env:    GEMINI_OUT, GEMINI_PREFIX, GEMINI_TIMEOUT (default 900s), GEMINI_WIN_DOWNLOADS,
+#         GEMINI_STAGE_DIR / GEMINI_STAGE_WIN (WSL /mnt/c staging + its Windows path base)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DRIVER="$HERE/driver_vid.py"
+
+PREFIX="${GEMINI_PREFIX:-vid}"; IMG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--prefix) PREFIX="$2"; shift 2 ;;
+    -i|--image)  IMG="$2";    shift 2 ;;
+    *) break ;;
+  esac
+done
+
+PROMPT="${1:-}"
+[ -z "$PROMPT" ] && { echo "usage: gemini-vid [-p prefix] [-i input.png] \"prompt\" [outdir]" >&2; exit 2; }
+OUT="${2:-${GEMINI_OUT:-$HOME/gemini-web/out}}"
+
+# ensure the request actually asks for a video
+case "$PROMPT" in
+  *[Vv]ideo*|*[Cc]lip*|*[Aa]nimate*) : ;;
+  *) PROMPT="Generate a video of $PROMPT" ;;
+esac
+
+# image->video: pass the LOCAL path; the driver uploads it host-agnostically over CDP.
+if [ -n "$IMG" ]; then
+  [ -f "$IMG" ] || { echo "input image not found: $IMG" >&2; exit 2; }
+  export GEMINI_INPUT_PATH="$(readlink -f "$IMG")"
+fi
+
+GEMINI_PROMPT="$PROMPT" GEMINI_OUT="$OUT" GEMINI_PREFIX="$PREFIX" \
+GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-900}" \
+GEMINI_WIN_DOWNLOADS="${GEMINI_WIN_DOWNLOADS:-}" \
+  browser-harness -c "exec(open('$DRIVER').read())" 2>&1 \
+  | sed -n 's/^RESULT //p'

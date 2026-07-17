@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+cookies.json
+out/
+
+# Specific to a private two-host (local Chrome -> remote headless) cookie bridge; depends on
+# tooling that isn't public, so it stays out of the published repo.
+scripts/cookie_bridge_pull.py
+scripts/cookie_bridge_inject.py
