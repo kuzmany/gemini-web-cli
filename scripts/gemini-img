@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# gemini-img — generate/edit an image via the real logged-in gemini.google.com tab
+# gemini-img — generate/edit an image via the real logged-in gemini.google.com web app
 # (browser-piggyback). Uses your Gemini subscription (Nano Banana), NOT the API.
 #
 # text->image:   gemini-img "a red cat on a blue chair" [outdir]
 # image->image:  gemini-img -i photo.png "make it winter, snow everywhere" [outdir]
 # Flags:  -p <prefix>   output filename prefix       -i <path>  input image to edit
-# Env:    GEMINI_OUT (default ~/gemini-web/out), GEMINI_PREFIX, GEMINI_TIMEOUT (s)
-# Host-agnostic: input images upload over CDP (no shared filesystem), local or remote Chrome.
+# Env (or ~/gemini-web/config.env): GEMINI_PROFILE, GEMINI_ACCOUNT, GEMINI_AUTHUSER (see gemini-vid),
+#         GEMINI_OUT (default ~/gemini-web/out), GEMINI_PREFIX, GEMINI_TIMEOUT (s)
+# Each run opens a fresh tab in the profile, works there in the background, and closes it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DRIVER="$HERE/driver_img.py"
+
+# Settings file: plain KEY=value lines; values already set in the environment win.
+CONF="$HOME/gemini-web/config.env"
+if [ -f "$CONF" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in GEMINI_*) [ -z "${!key:-}" ] && export "$key=$value" ;; esac
+  done < <(grep -E '^[[:space:]]*GEMINI_[A-Z_]+=' "$CONF" | sed 's/^[[:space:]]*//')
+fi
 
 PREFIX="${GEMINI_PREFIX:-gen}"; IMG=""
 while [ $# -gt 0 ]; do
@@ -25,13 +34,26 @@ PROMPT="${1:-}"
 [ -z "$PROMPT" ] && { echo "usage: gemini-img [-p prefix] [-i input.png] \"prompt\" [outdir]" >&2; exit 2; }
 OUT="${2:-${GEMINI_OUT:-$HOME/gemini-web/out}}"
 
-# image->image: pass the LOCAL path; the driver uploads it host-agnostically over CDP.
+# image->image: pass the LOCAL path; the driver pastes its bytes into the composer over CDP.
 if [ -n "$IMG" ]; then
   [ -f "$IMG" ] || { echo "input image not found: $IMG" >&2; exit 2; }
   export GEMINI_INPUT_PATH="$(readlink -f "$IMG")"
 fi
 
+mkdir -p "$OUT"
+APP="https://gemini.google.com/u/${GEMINI_AUTHUSER:-0}/app"
+OPENED=$(bh-open ${GEMINI_PROFILE:+"$GEMINI_PROFILE"} "$APP" 2>&1) || { echo "{\"error\": \"bh-open failed\"}"; exit 4; }
+TARGET=$(printf '%s\n' "$OPENED" | sed -n 's/.*"target_id": "\([^"]*\)".*/\1/p' | tail -1)
+close_tab() { [ -n "$TARGET" ] && browser-harness -c "cdp('Target.closeTarget', targetId='$TARGET')" >/dev/null 2>&1 || true; }
+trap close_tab EXIT
+
+set +e
 GEMINI_PROMPT="$PROMPT" GEMINI_OUT="$OUT" GEMINI_PREFIX="$PREFIX" \
 GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-420}" \
-  browser-harness -c "exec(open('$DRIVER').read())" 2>&1 \
-  | sed -n 's/^RESULT //p'
+  browser-harness -c "import time; time.sleep(4); exec(open('$DRIVER').read())" > "$OUT/.gemini-img.$$.log" 2>&1
+STATUS=$?
+set -e
+sed -n 's/^RESULT //p' "$OUT/.gemini-img.$$.log"
+grep -q '^RESULT ' "$OUT/.gemini-img.$$.log" || tail -3 "$OUT/.gemini-img.$$.log" >&2
+rm -f "$OUT/.gemini-img.$$.log"
+exit $STATUS

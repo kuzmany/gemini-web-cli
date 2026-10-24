@@ -1,44 +1,148 @@
-#!/usr/bin/env bash
-# gemini-vid — generate/animate a VIDEO (Veo) via the real logged-in gemini.google.com tab
-# (browser-piggyback). Uses your Gemini subscription (Veo/Flow credits), NOT the API.
-#
-# text->video:   gemini-vid "a red balloon floating over a green meadow" [outdir]
-# image->video:  gemini-vid -i photo.png "gentle push-in, leaves sway" [outdir]
-# Flags:  -p <prefix>   output filename prefix       -i <path>  input image to animate
-# Env:    GEMINI_OUT, GEMINI_PREFIX, GEMINI_TIMEOUT (default 900s), GEMINI_WIN_DOWNLOADS,
-#         GEMINI_STAGE_DIR / GEMINI_STAGE_WIN (WSL /mnt/c staging + its Windows path base)
-set -euo pipefail
+#!/usr/bin/env python3
+"""gemini-vid: make one video with Veo through the logged-in gemini.google.com web app.
 
-HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-DRIVER="$HERE/driver_vid.py"
+Billed to the Gemini subscription, never the API. Each step (send, then one check per minute)
+runs in a fresh tab of the chosen Chrome profile, so a finished video is always seen, and no step
+needs the window in the foreground.
 
-PREFIX="${GEMINI_PREFIX:-vid}"; IMG=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -p|--prefix) PREFIX="$2"; shift 2 ;;
-    -i|--image)  IMG="$2";    shift 2 ;;
-    *) break ;;
-  esac
-done
+  gemini-vid "a paper boat in a rain puddle, cinematic" [outdir]       text -> video
+  gemini-vid -i still.png "slow push-in, mist drifts" [outdir]         image -> video
+  gemini-vid -i still.png -o /abs/clip.mp4 "prompt"                    exact output file, resumable
 
-PROMPT="${1:-}"
-[ -z "$PROMPT" ] && { echo "usage: gemini-vid [-p prefix] [-i input.png] \"prompt\" [outdir]" >&2; exit 2; }
-OUT="${2:-${GEMINI_OUT:-$HOME/gemini-web/out}}"
+Flags: -i image, -o output file, -p filename prefix (when no -o).
+Settings come from the environment, else ~/gemini-web/config.env (KEY=value lines):
+  GEMINI_PROFILE   automation Chrome profile for bh-open (default: the bh-open default)
+  GEMINI_ACCOUNT   email that must be signed in; the run stops otherwise
+  GEMINI_AUTHUSER  the /u/<n>/ index of that account in Gemini (default 0)
+  GEMINI_OUT       default output directory (default ~/gemini-web/out)
+  GEMINI_TIMEOUT   seconds to wait for the video (default 1800); GEMINI_POLL seconds between checks (60)
 
-# ensure the request actually asks for a video
-case "$PROMPT" in
-  *[Vv]ideo*|*[Cc]lip*|*[Aa]nimate*) : ;;
-  *) PROMPT="Generate a video of $PROMPT" ;;
-esac
+With -o the chat url is kept in <out>.chat until the video is downloaded, so running the same
+command again picks the same job up instead of paying for a new one.
 
-# image->video: pass the LOCAL path; the driver uploads it host-agnostically over CDP.
-if [ -n "$IMG" ]; then
-  [ -f "$IMG" ] || { echo "input image not found: $IMG" >&2; exit 2; }
-  export GEMINI_INPUT_PATH="$(readlink -f "$IMG")"
-fi
+Prints one JSON line: {"videos": [path], "bytes": n, "chat": url} or {"error": ...}.
+Exit codes: 2 timeout, 3 limit or refusal, 4 login or wrong account, 5 extraction, 6 upload.
+"""
+import argparse, json, os, re, subprocess, sys, tempfile, time
 
-GEMINI_PROMPT="$PROMPT" GEMINI_OUT="$OUT" GEMINI_PREFIX="$PREFIX" \
-GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-900}" \
-GEMINI_WIN_DOWNLOADS="${GEMINI_WIN_DOWNLOADS:-}" \
-  browser-harness -c "exec(open('$DRIVER').read())" 2>&1 \
-  | sed -n 's/^RESULT //p'
+HERE = os.path.dirname(os.path.realpath(__file__))
+DRIVER = os.path.join(HERE, "driver_tab.py")
+LIMIT = re.compile(r"limit|quota|try again later|can.t (generate|create) more|upgrade|reached", re.I)
+
+
+def config():
+    conf = {}
+    path = os.path.expanduser("~/gemini-web/config.env")
+    if os.path.exists(path):
+        for line in open(path):
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.strip().split("=", 1)
+                conf[key.strip()] = value.strip().strip('"')
+    conf.update({k: v for k, v in os.environ.items() if k.startswith("GEMINI_")})
+    return conf
+
+
+def finish(obj, code=0):
+    print(json.dumps(obj), flush=True)
+    sys.exit(code)
+
+
+def step(conf, url, env):
+    """Open url in a new tab, run one driver mode there, close the tab, return (kind, value)."""
+    cmd = ["bh-open"] + ([conf["GEMINI_PROFILE"]] if conf.get("GEMINI_PROFILE") else []) + [url]
+    opened = subprocess.run(cmd, capture_output=True, text=True)
+    if opened.returncode != 0:
+        finish({"error": f"bh-open failed: {opened.stderr.strip().splitlines()[-1:]}"}, 4)
+    target = re.search(r'"target_id": "([^"]+)"', opened.stdout)
+    code = f"import time; time.sleep(4); exec(open({DRIVER!r}).read())"
+    try:
+        res = subprocess.run(["browser-harness", "-c", code], capture_output=True, text=True,
+                             env={**os.environ, **env}, timeout=360)
+        output, errors = res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        output, errors = "", "browser-harness step timed out"
+    if target:
+        subprocess.run(["browser-harness", "-c", f"cdp('Target.closeTarget', targetId={target.group(1)!r})"],
+                       capture_output=True, text=True)
+    line = next((l for l in output.splitlines() if l.startswith("GV ")), None)
+    if not line:
+        finish({"error": "no answer from the Gemini tab", "detail": errors.strip().splitlines()[-2:]}, 5)
+    _, kind, *rest = line.split(" ", 2)
+    return kind, rest[0] if rest else ""
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="Veo video through the Gemini web app")
+    ap.add_argument("-i", "--image")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("-p", "--prefix", default=os.environ.get("GEMINI_PREFIX", "vid"))
+    ap.add_argument("prompt")
+    ap.add_argument("outdir", nargs="?")
+    args = ap.parse_args()
+    conf = config()
+
+    if args.out:
+        out = os.path.abspath(args.out)
+    else:
+        outdir = args.outdir or conf.get("GEMINI_OUT") or os.path.expanduser("~/gemini-web/out")
+        out = os.path.join(os.path.abspath(outdir), f"{args.prefix}_{int(time.time())}.mp4")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if os.path.exists(out):
+        finish({"error": f"output exists, refusing to overwrite: {out}"}, 2)
+    if args.image and not os.path.isfile(args.image):
+        finish({"error": f"input image not found: {args.image}"}, 2)
+
+    prompt = args.prompt if re.search(r"video|clip|animate", args.prompt, re.I) else f"Generate a video: {args.prompt}"
+    app = f"https://gemini.google.com/u/{conf.get('GEMINI_AUTHUSER', '0')}/app"
+    chat_file = out + ".chat"
+    chat = open(chat_file).read().strip() if os.path.exists(chat_file) else ""
+
+    if not chat:
+        env = {"GV_MODE": "submit", "GV_PROMPT": prompt, "GV_ACCOUNT": conf.get("GEMINI_ACCOUNT", "")}
+        tmp = None
+        if args.image:
+            # A JPEG is about 5x smaller than the PNG stills, so the paste finishes much sooner.
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", args.image, "-q:v", "3", tmp], check=True)
+            env["GV_IMAGE"] = tmp
+        try:
+            kind, value = step(conf, app, env)
+        finally:
+            if tmp:
+                os.remove(tmp)
+        if kind == "ERROR":
+            code, _, text = value.partition(" ")
+            finish({"error": text}, int(code))
+        chat = value
+        if args.out:
+            open(chat_file, "w").write(chat + "\n")
+        print(f"[gemini-vid] sent: {chat}", file=sys.stderr, flush=True)
+
+    started = time.time()
+    timeout, poll = float(conf.get("GEMINI_TIMEOUT", 1800)), float(conf.get("GEMINI_POLL", 60))
+    while time.time() - started < timeout:
+        time.sleep(poll)
+        jar = out + ".cookies"
+        kind, value = step(conf, chat, {"GV_MODE": "fetch", "GV_JAR": jar})
+        if kind == "PENDING":
+            continue
+        if kind == "FAILED":
+            finish({"error": "Gemini answered without a video", "reply": value, "chat": chat}, 3 if LIMIT.search(value) else 5)
+        try:
+            subprocess.run(["curl", "-sfL", "-b", jar, "-o", out, value], check=True)
+        except subprocess.CalledProcessError:
+            finish({"error": "video download failed", "chat": chat}, 5)
+        finally:
+            if os.path.exists(jar):
+                os.remove(jar)
+        if os.path.getsize(out) < 100000:
+            os.remove(out)
+            finish({"error": "downloaded file is not a video", "chat": chat}, 5)
+        if os.path.exists(chat_file):
+            os.remove(chat_file)
+        finish({"videos": [out], "bytes": os.path.getsize(out), "chat": chat})
+    finish({"error": f"no video after {int(timeout)} s; run the same command again to keep waiting", "chat": chat}, 2)
+
+
+if __name__ == "__main__":
+    main()
